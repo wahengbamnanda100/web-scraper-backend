@@ -37,7 +37,16 @@ const getBrowser = async () => {
 	const fs = require("fs");
 	const os = require("os");
 	let executablePath;
-	let launchArgs = ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"];
+	let launchArgs = [
+		"--no-sandbox",
+		"--disable-setuid-sandbox",
+		"--disable-dev-shm-usage",
+		"--disable-accelerated-2d-canvas",
+		"--no-first-run",
+		"--no-zygote",
+		"--disable-gpu",
+		"--single-process", // Critical for low-memory environments
+	];
 	let defaultViewport = { width: 1280, height: 800 };
 	let headlessMode = "new";
 
@@ -55,15 +64,25 @@ const getBrowser = async () => {
 	if (localChrome) {
 		console.log(`[Browser] Using local Chrome: ${localChrome}`);
 		executablePath = localChrome;
+		// Remove --single-process for local development (causes issues on macOS)
+		launchArgs = launchArgs.filter(arg => arg !== "--single-process");
 	} else {
 		// Serverless fallback: use @sparticuz/chromium (only works on Linux)
 		try {
 			const chromium = require("@sparticuz/chromium");
 			executablePath = await chromium.executablePath();
-			launchArgs = chromium.args;
+			// Use chromium.args but add our memory-saving flags
+			launchArgs = [
+				...chromium.args,
+				"--disable-dev-shm-usage",
+				"--disable-accelerated-2d-canvas",
+				"--no-first-run",
+				"--no-zygote",
+				"--single-process",
+			];
 			defaultViewport = chromium.defaultViewport;
 			headlessMode = chromium.headless;
-			console.log(`[Browser] Using @sparticuz/chromium`);
+			console.log(`[Browser] Using @sparticuz/chromium with low-memory flags`);
 		} catch (e) {
 			throw new Error("No Chrome/Chromium binary found. Install Chrome or set CHROME_PATH.");
 		}
@@ -79,13 +98,13 @@ const getBrowser = async () => {
 	return browserInstance;
 };
 
-// ── Fetch page HTML using headless browser ──
-// Each request uses a fresh incognito context (clean cookies/state)
-// so Cloudflare treats it as a new visitor and skips Turnstile challenges.
-const fetchWithBrowser = async (url, retryCount = 0) => {
+// ── Fetch page HTML using headless browser with optional context reuse ──
+// For single requests: creates fresh context (Cloudflare bypass)
+// For series: pass existing context to reduce memory usage
+const fetchWithBrowser = async (url, retryCount = 0, reuseContext = null) => {
 	const MAX_RETRIES = 2;
 
-	console.log(`[Puppeteer] Fetching: ${url}`);
+	console.log(`[Puppeteer] Fetching: ${url}${reuseContext ? ' (reusing context)' : ''}`);
 
 	// Reset stale browser
 	if (browserInstance && !browserInstance.isConnected()) {
@@ -94,17 +113,18 @@ const fetchWithBrowser = async (url, retryCount = 0) => {
 	}
 
 	let browser, context, page;
+	const createdNewContext = !reuseContext;
 
 	try {
 		browser = await getBrowser();
-		context = await browser.createBrowserContext();
+		context = reuseContext || await browser.createBrowserContext();
 		page = await context.newPage();
 	} catch (err) {
 		if (retryCount < MAX_RETRIES) {
 			console.log(`[Browser] Failed to create context (attempt ${retryCount + 1}/${MAX_RETRIES}), retrying...`);
 			browserInstance = null;
 			await new Promise(r => setTimeout(r, 2000));
-			return fetchWithBrowser(url, retryCount + 1);
+			return fetchWithBrowser(url, retryCount + 1, reuseContext);
 		}
 		throw new Error(`Browser context creation failed after ${MAX_RETRIES} retries: ${err.message}`);
 	}
@@ -183,7 +203,10 @@ const fetchWithBrowser = async (url, retryCount = 0) => {
 		return await page.content();
 	} finally {
 		await page.close();
-		await context.close();
+		// Only close context if we created it (don't close reused contexts)
+		if (createdNewContext) {
+			await context.close();
+		}
 	}
 };
 
@@ -215,7 +238,7 @@ const fetchWithAxios = async (url) => {
 };
 
 // ── Fetch page HTML with automatic Axios → Puppeteer fallback ──
-const fetchPageUncached = async (url) => {
+const fetchPageUncached = async (url, reuseContext = null) => {
 	try {
 		return await fetchWithAxios(url);
 	} catch (axiosError) {
@@ -223,7 +246,7 @@ const fetchPageUncached = async (url) => {
 		if (status === 403 || status === 503) {
 			console.log(`[Fallback] Axios got ${status}, switching to Puppeteer for: ${url}`);
 			try {
-				return await fetchWithBrowser(url);
+				return await fetchWithBrowser(url, 0, reuseContext);
 			} catch (browserError) {
 				throw new Error(
 					`Failed to fetch ${url}. Blocked by site protection (tried headless browser). Error: ${browserError.message}`
@@ -240,14 +263,14 @@ const fetchPageUncached = async (url) => {
 };
 
 // ── Cached fetch — avoids double-fetching pages that were recently loaded ──
-const fetchPage = async (url) => {
+const fetchPage = async (url, reuseContext = null) => {
 	const cached = pageCache.get(url);
 	if (cached && Date.now() - cached.ts < PAGE_CACHE_TTL) {
 		console.log(`[Cache] Hit for: ${url}`);
 		return cached.html;
 	}
 
-	const html = await fetchPageUncached(url);
+	const html = await fetchPageUncached(url, reuseContext);
 	pageCache.set(url, { html, ts: Date.now() });
 
 	// Evict stale entries
@@ -375,107 +398,126 @@ const scrapeSeriesListing = async (url, sendEvent, req) => {
 	const DELAY_BETWEEN_STORIES = 2000;
 	const PAGE_LIMIT = 20;
 
-	// Step 1: Fetch the first listing page
-	console.log(`[Series] Fetching listing page: ${url}`);
-	const firstPageHtml = await fetchPage(url);
-	const { stories: firstPageStories, lastPage, seriesName } = extractListingData(firstPageHtml, url);
+	// Create a single browser context for the entire series (memory optimization)
+	let browser, sharedContext;
+	try {
+		browser = await getBrowser();
+		sharedContext = await browser.createBrowserContext();
+		console.log(`[Series] Created shared browser context for memory efficiency`);
+	} catch (err) {
+		console.error(`[Series] Failed to create browser context: ${err.message}`);
+		throw new Error(`Failed to initialize browser for series scraping: ${err.message}`);
+	}
 
-	const estimatedStories = firstPageStories.length * lastPage;
-	sendEvent("detecting", { seriesName, totalPages: lastPage, estimatedStories });
-	console.log(`[Series] "${seriesName}" — ${lastPage} pages, ~${estimatedStories} stories`);
+	try {
+		// Step 1: Fetch the first listing page
+		console.log(`[Series] Fetching listing page: ${url}`);
+		const firstPageHtml = await fetchPage(url, sharedContext);
+		const { stories: firstPageStories, lastPage, seriesName } = extractListingData(firstPageHtml, url);
 
-	// Step 2: Traverse pages in REVERSE (last page has oldest stories)
-	const allStories = [];
+		const estimatedStories = firstPageStories.length * lastPage;
+		sendEvent("detecting", { seriesName, totalPages: lastPage, estimatedStories });
+		console.log(`[Series] "${seriesName}" — ${lastPage} pages, ~${estimatedStories} stories`);
 
-	for (let page = lastPage; page >= 1; page--) {
-		if (req.aborted) {
-			console.log(`[Series] Client disconnected, stopping.`);
-			return;
+		// Step 2: Traverse pages in REVERSE (last page has oldest stories)
+		const allStories = [];
+
+		for (let page = lastPage; page >= 1; page--) {
+			if (req.aborted) {
+				console.log(`[Series] Client disconnected, stopping.`);
+				return;
+			}
+
+			let pageStories;
+			if (page === 1) {
+				// Already fetched page 1
+				pageStories = firstPageStories;
+			} else {
+				const pageUrl = buildPageUrl(url, page);
+				console.log(`[Series] Fetching page ${page}/${lastPage}: ${pageUrl}`);
+				sendEvent("page_progress", { currentPage: page, totalPages: lastPage });
+				try {
+					const pageHtml = await fetchPage(pageUrl, sharedContext);
+					const data = extractListingData(pageHtml, pageUrl);
+					pageStories = data.stories;
+				} catch (err) {
+					console.log(`[Series] Failed to fetch page ${page}: ${err.message}`);
+					sendEvent("page_error", { page, error: err.message });
+					continue;
+				}
+			}
+
+			// Within each page, stories are newest-first, so reverse them
+			allStories.push(...pageStories.reverse());
 		}
 
-		let pageStories;
-		if (page === 1) {
-			// Already fetched page 1
-			pageStories = firstPageStories;
-		} else {
-			const pageUrl = buildPageUrl(url, page);
-			console.log(`[Series] Fetching page ${page}/${lastPage}: ${pageUrl}`);
-			sendEvent("page_progress", { currentPage: page, totalPages: lastPage });
+		// Step 3: Deduplicate by URL
+		const seen = new Set();
+		const uniqueStories = allStories.filter((s) => {
+			if (seen.has(s.url)) return false;
+			seen.add(s.url);
+			return true;
+		});
+
+		console.log(`[Series] Total unique stories: ${uniqueStories.length}`);
+		sendEvent("collecting_done", { totalStories: uniqueStories.length });
+
+		// Step 4: Scrape each story (reusing the same context)
+		let fullContent = "";
+		const failedStories = [];
+		const totalStories = uniqueStories.length;
+
+		for (let i = 0; i < totalStories; i++) {
+			if (req.aborted) {
+				console.log(`[Series] Client disconnected, stopping at story ${i + 1}.`);
+				return;
+			}
+
+			const story = uniqueStories[i];
+			sendEvent("progress", { current: i + 1, total: totalStories, storyTitle: story.title });
+
 			try {
-				const pageHtml = await fetchPage(pageUrl);
-				const data = extractListingData(pageHtml, pageUrl);
-				pageStories = data.stories;
+				// In a series, each listing entry is one episode — do NOT follow nextPageLink
+				// (nextPageLink would chain to the next episode, causing O(n²) redundancy)
+				const html = await fetchPage(story.url, sharedContext);
+				const { markdownContent } = parsePageContent(html, story.url);
+
+				if (i > 0) fullContent += "\n\n---\n\n";
+				fullContent += `## ${story.title}\n\n${markdownContent}`;
+
+				console.log(`[Series] Scraped story ${i + 1}/${totalStories}: "${story.title}"`);
 			} catch (err) {
-				console.log(`[Series] Failed to fetch page ${page}: ${err.message}`);
-				sendEvent("page_error", { page, error: err.message });
-				continue;
+				console.log(`[Series] Failed story ${i + 1}: "${story.title}" — ${err.message}`);
+				failedStories.push({ index: i, url: story.url, title: story.title, error: err.message });
+				sendEvent("story_error", { index: i + 1, url: story.url, title: story.title, error: err.message });
+
+				if (i > 0) fullContent += "\n\n---\n\n";
+				fullContent += `## ${story.title} (Failed to scrape)\n\n*Could not scrape this story. Error: ${err.message}*\n*URL: ${story.url}*`;
+			}
+
+			// Delay between stories to avoid rate limiting
+			if (i < totalStories - 1) {
+				await new Promise((r) => setTimeout(r, DELAY_BETWEEN_STORIES));
 			}
 		}
 
-		// Within each page, stories are newest-first, so reverse them
-		allStories.push(...pageStories.reverse());
-	}
+		// Step 5: Send final result
+		sendEvent("done", {
+			title: seriesName,
+			content: fullContent.trim(),
+			totalStories,
+			failedStories: failedStories.length,
+			seriesName,
+		});
 
-	// Step 3: Deduplicate by URL
-	const seen = new Set();
-	const uniqueStories = allStories.filter((s) => {
-		if (seen.has(s.url)) return false;
-		seen.add(s.url);
-		return true;
-	});
-
-	console.log(`[Series] Total unique stories: ${uniqueStories.length}`);
-	sendEvent("collecting_done", { totalStories: uniqueStories.length });
-
-	// Step 4: Scrape each story
-	let fullContent = "";
-	const failedStories = [];
-	const totalStories = uniqueStories.length;
-
-	for (let i = 0; i < totalStories; i++) {
-		if (req.aborted) {
-			console.log(`[Series] Client disconnected, stopping at story ${i + 1}.`);
-			return;
-		}
-
-		const story = uniqueStories[i];
-		sendEvent("progress", { current: i + 1, total: totalStories, storyTitle: story.title });
-
-		try {
-			// In a series, each listing entry is one episode — do NOT follow nextPageLink
-			// (nextPageLink would chain to the next episode, causing O(n²) redundancy)
-			const html = await fetchPage(story.url);
-			const { markdownContent } = parsePageContent(html, story.url);
-
-			if (i > 0) fullContent += "\n\n---\n\n";
-			fullContent += `## ${story.title}\n\n${markdownContent}`;
-
-			console.log(`[Series] Scraped story ${i + 1}/${totalStories}: "${story.title}"`);
-		} catch (err) {
-			console.log(`[Series] Failed story ${i + 1}: "${story.title}" — ${err.message}`);
-			failedStories.push({ index: i, url: story.url, title: story.title, error: err.message });
-			sendEvent("story_error", { index: i + 1, url: story.url, title: story.title, error: err.message });
-
-			if (i > 0) fullContent += "\n\n---\n\n";
-			fullContent += `## ${story.title} (Failed to scrape)\n\n*Could not scrape this story. Error: ${err.message}*\n*URL: ${story.url}*`;
-		}
-
-		// Delay between stories to avoid rate limiting
-		if (i < totalStories - 1) {
-			await new Promise((r) => setTimeout(r, DELAY_BETWEEN_STORIES));
+		console.log(`[Series] Complete. ${totalStories} stories, ${failedStories.length} failed.`);
+	} finally {
+		// Clean up the shared context
+		if (sharedContext) {
+			await sharedContext.close();
+			console.log(`[Series] Closed shared browser context`);
 		}
 	}
-
-	// Step 5: Send final result
-	sendEvent("done", {
-		title: seriesName,
-		content: fullContent.trim(),
-		totalStories,
-		failedStories: failedStories.length,
-		seriesName,
-	});
-
-	console.log(`[Series] Complete. ${totalStories} stories, ${failedStories.length} failed.`);
 };
 
 // NEW: Health check endpoint for keep-alive services
