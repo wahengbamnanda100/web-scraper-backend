@@ -203,31 +203,48 @@ const fetchWithBrowser = async (url, retryCount = 0, reuseContext = null) => {
 	}
 };
 
-// ── Fetch page HTML using axios (fast path) ──
-const fetchWithAxios = async (url) => {
+// ── Fetch page HTML using axios with enhanced headers ──
+const fetchWithAxios = async (url, retryCount = 0) => {
+	const MAX_AXIOS_RETRIES = 2;
 	let origin;
 	try { origin = new URL(url).origin; } catch (e) { origin = url; }
 
-	const { data } = await axios.get(url, {
-		headers: {
-			"User-Agent":
-				"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-			"Accept-Language": "en-US,en;q=0.9",
-			"Accept-Encoding": "gzip, deflate, br",
-			"Referer": origin + "/",
-			"Connection": "keep-alive",
-			"Upgrade-Insecure-Requests": "1",
-			"Sec-Fetch-Dest": "document",
-			"Sec-Fetch-Mode": "navigate",
-			"Sec-Fetch-Site": "same-origin",
-			"Cache-Control": "max-age=0",
-		},
-		timeout: 20000,
-		maxRedirects: 5,
-	});
+	try {
+		const { data } = await axios.get(url, {
+			headers: {
+				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Encoding": "gzip, deflate, br, zstd",
+				"Referer": origin + "/",
+				"Connection": "keep-alive",
+				"Upgrade-Insecure-Requests": "1",
+				"Sec-Fetch-Dest": "document",
+				"Sec-Fetch-Mode": "navigate",
+				"Sec-Fetch-Site": "none",
+				"Sec-Fetch-User": "?1",
+				"sec-ch-ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+				"sec-ch-ua-mobile": "?0",
+				"sec-ch-ua-platform": '"Windows"',
+				"DNT": "1",
+				"Cache-Control": "max-age=0",
+			},
+			timeout: 25000,
+			maxRedirects: 5,
+			validateStatus: (status) => status < 500, // Don't throw on 4xx
+		});
 
-	return data;
+		return data;
+	} catch (axiosError) {
+		// Retry with exponential backoff for network errors
+		if (retryCount < MAX_AXIOS_RETRIES && axiosError.code === 'ECONNRESET') {
+			const delay = Math.pow(2, retryCount) * 1000;
+			console.log(`[Axios] Connection reset, retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_AXIOS_RETRIES})`);
+			await new Promise(r => setTimeout(r, delay));
+			return fetchWithAxios(url, retryCount + 1);
+		}
+		throw axiosError;
+	}
 };
 
 // ── Fetch page HTML with automatic Axios → Puppeteer fallback ──
