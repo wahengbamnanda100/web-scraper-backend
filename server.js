@@ -64,25 +64,18 @@ const getBrowser = async () => {
 	if (localChrome) {
 		console.log(`[Browser] Using local Chrome: ${localChrome}`);
 		executablePath = localChrome;
-		// Remove --single-process for local development (causes issues on macOS)
+		// Remove problematic flags for local development
 		launchArgs = launchArgs.filter(arg => arg !== "--single-process");
 	} else {
 		// Serverless fallback: use @sparticuz/chromium (only works on Linux)
 		try {
 			const chromium = require("@sparticuz/chromium");
 			executablePath = await chromium.executablePath();
-			// Use chromium.args but add our memory-saving flags
-			launchArgs = [
-				...chromium.args,
-				"--disable-dev-shm-usage",
-				"--disable-accelerated-2d-canvas",
-				"--no-first-run",
-				"--no-zygote",
-				"--single-process",
-			];
+			// Use chromium's optimized args directly (they're already tuned for serverless)
+			launchArgs = chromium.args;
 			defaultViewport = chromium.defaultViewport;
 			headlessMode = chromium.headless;
-			console.log(`[Browser] Using @sparticuz/chromium with low-memory flags`);
+			console.log(`[Browser] Using @sparticuz/chromium with recommended args`);
 		} catch (e) {
 			throw new Error("No Chrome/Chromium binary found. Install Chrome or set CHROME_PATH.");
 		}
