@@ -234,6 +234,15 @@ const fetchWithAxios = async (url, retryCount = 0) => {
 			validateStatus: (status) => status < 500, // Don't throw on 4xx
 		});
 
+		// Detect Cloudflare challenge page
+		if (typeof data === 'string' && data.includes('Just a moment...') && data.includes('challenges.cloudflare.com')) {
+			console.log(`[Axios] Cloudflare challenge detected, axios cannot bypass - need Puppeteer`);
+			// Throw 403 to trigger Puppeteer fallback
+			const error = new Error('Cloudflare challenge page detected');
+			error.response = { status: 403 };
+			throw error;
+		}
+
 		return data;
 	} catch (axiosError) {
 		// Retry with exponential backoff for network errors
@@ -276,12 +285,22 @@ const fetchPageUncached = async (url, reuseContext = null) => {
 const fetchPage = async (url, reuseContext = null) => {
 	const cached = pageCache.get(url);
 	if (cached && Date.now() - cached.ts < PAGE_CACHE_TTL) {
-		console.log(`[Cache] Hit for: ${url}`);
-		return cached.html;
+		// Don't use cache if it's a Cloudflare challenge page
+		if (!cached.html.includes('Just a moment...')) {
+			console.log(`[Cache] Hit for: ${url}`);
+			return cached.html;
+		} else {
+			console.log(`[Cache] Evicting Cloudflare challenge page for: ${url}`);
+			pageCache.delete(url);
+		}
 	}
 
 	const html = await fetchPageUncached(url, reuseContext);
-	pageCache.set(url, { html, ts: Date.now() });
+
+	// Don't cache Cloudflare challenge pages
+	if (!html.includes('Just a moment...')) {
+		pageCache.set(url, { html, ts: Date.now() });
+	}
 
 	// Evict stale entries
 	for (const [key, val] of pageCache) {
