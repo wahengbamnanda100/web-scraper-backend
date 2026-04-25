@@ -323,6 +323,14 @@ const parsePageContent = (html, url) => {
 		$('a.next-page').attr("href") ||
 		null;
 
+	// Debug: log first 500 chars of HTML to see structure
+	if (!title || !contentHtml) {
+		const htmlSnippet = $.html().substring(0, 500);
+		console.log(`[Parse] Failed - HTML snippet:`, htmlSnippet);
+		console.log(`[Parse] Available H1s:`, $('h1').map((i, el) => $(el).attr('class') + ': ' + $(el).text().trim()).get());
+		console.log(`[Parse] Available sections:`, $('section, article, .content, .story, .post').map((i, el) => el.name + '.' + ($(el).attr('class') || '')).get().slice(0, 10));
+	}
+
 	console.log(`[Parse] Title: "${title}", Author: "${author}", Content length: ${contentHtml.length}, Next: ${nextPageLink || "none"}`);
 
 	if (!title || !contentHtml) {
